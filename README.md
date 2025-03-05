@@ -22,7 +22,8 @@ Bu araç, hedefli dizileme verilerindeki düşük kapsama sahip gen bölgelerini
 
 ## Kurulum
 
-1.  Google Sheets'te, verilerinizi içeren bir tablo oluşturun. Tablonun aşağıdaki sütunları içermesi gerekmektedir:
+1. (paired)_Per-region_QC_for_Targeted_Sequencing.xls tablonuzu Google tablolar içinde içeri aktarın. Dosya--> içe aktar --> yükle --> yeni sayfa oluştur.
+2.   Tablonun aşağıdaki sütunları içermesi gerekmektedir:
     *   Chromosome
     *   Region
     *   Name
@@ -42,8 +43,8 @@ Bu araç, hedefli dizileme verilerindeki düşük kapsama sahip gen bölgelerini
     *   Zero coverage bases
     *   Mean coverage (excluding zero coverage)
     *   Median coverage (excluding zero coverage)
-2.  Google Sheets'te, "Araçlar" (Tools) menüsüne gidin ve "Komut Dosyası Düzenleyicisi" (Script editor) seçeneğini tıklayın.
-3.  Açılan Google Apps Script düzenleyicisine aşağıdaki kodu yapıştırın:
+3.  Google Sheets'te, "Araçlar" (Tools) menüsüne gidin ve "Komut Dosyası Düzenleyicisi" (Script editor) seçeneğini tıklayın.
+4.  Açılan Google Apps Script düzenleyicisine aşağıdaki kodu yapıştırın:
 
     ```
     function onOpen() {
@@ -117,11 +118,11 @@ Bu araç, hedefli dizileme verilerindeki düşük kapsama sahip gen bölgelerini
     }
     ```
 
-4.  Kodu kaydedin ve düzenleyiciyi kapatın.
+5.  Kodu kaydedin ve düzenleyiciyi kapatın.
 
 ## Kullanım
 
-1.  Google Sheets'te, verilerinizi içeren tabloyu açın.
+1.  Google Sheets'te, verilerinizi içeren tabloyu açın. İçeri aktarılan tablo aktif olmalıdır.
 2.  Menü çubuğunda, "Kapsama Analizi" adlı yeni bir menü göreceksiniz.
 3.  "Kapsama Analizi" menüsünden, istediğiniz eşik değerine göre "Kapsama-50 Analizi" veya "Kapsama-100 Analizi" seçeneğini tıklayın.
 4.  Kodun Google E-Tablolarınıza erişmesine izin vermeniz istenebilir. İzinleri verin.
