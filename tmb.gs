@@ -1,262 +1,352 @@
-/**************************************************************
- *  T M B   (Qiagen/CLC CSV) – Tek Dosya, Çakışmasız Kurulum  *
- *  Menü: TMB  →  (1) Lung MSI • 3833   (2) Solid • 3204
- *  Çıktı: "tbm" adlı sayfaya özet rapor
+/**** =======================  TMB RAPORLAMA (Qiagen/CLC CSV)  ======================= ****
+ * Menü: TMB ▸ Akciğer (teknik) / Akciğer (klinik) / Solid (teknik) / Solid (klinik)
+ * - Kaynak: Aktif sayfa (Qiagen/CLC CSV export – sütun adları Türkçe/İngilizce karışık olabilir)
+ * - Çıktı: "tbm" sayfasına rapor metni + ilk N varyant listesi yazılır (varsa üzerine ekler)
+ * - Panel Mb: Menüyü seçtiğin panele göre sabit (konservatif)
  *
- *  © Aile için hazırlanmıştır. (Kasım 2025)
- **************************************************************/
+ * NOT:
+ *  - “Klinik” mod: yalnızca raporlanabilir (kodlayan-nonsynonymous SNV + kodlayan indeller + splice) sayılır,
+ *    benign/likely benign ve gnomAD≥0.001 olanlar dışlanır; intronik/UTR/promoter hariç tutulur (splice hariç).
+ *  - “Teknik” mod: panel tabanlı ham sayım (eşiklerle), PASS/AD/VAF yoksa türev kullanır (ALT≈VAF×DP).
+ *
+ * Güvenli varsayılanlar:
+ *  Strict thresholds: QUAL≥200, DP≥300, ALT≥15, 0.10≤VAF≤0.80, PASS, STR eleme açık
+ *  Loose  thresholds: QUAL≥ 50, DP≥100, ALT≥ 5, 0.05≤VAF≤0.95, PASS gerekmez, STR eleme kapalı
+ ****/
 
-/** ===========================================================
- *  >>>>>  PANEL ALANLARI (Mb) – GÜNCEL KONSERVATİF DEĞERLER <<<<<
- *  Sadece bu ikisini kendi doğrulanmış değerlerinize göre güncelleyin.
- *  CDHS-53206Z-3833 (Lung MSI) : 0.279–0.280 Mb → konservatif 0.279
- *  CDHS-53205Z-3204 (Solid)    : 0.231 Mb
- *  ===========================================================
- */
-const CONST_LUNG_MB  = 0.279;  // ✏️ Gerekirse güncelleyin
-const CONST_SOLID_MB = 0.231;  // ✏️ Gerekirse güncelleyin
+/////////////////////////// KULLANICI DÜZENLEYEBİLİR SABİTLER ///////////////////////////
 
-/** ===========================================================
- *  >>>>>  TEKNİK EŞİKLER (Sıkı ve Gevşek) – İsteğe göre değiştirilebilir
- *  QUAL, DP, ALT (≈ VAF×DP), VAF aralığı ve PASS şartı
- *  ===========================================================
- */
-const STRICT_THRESH = { QUAL: 200, DP: 300, ALT: 15, VAF_MIN: 0.10, VAF_MAX: 0.80, REQUIRE_PASS: true,  STR_FILTER: true  };
-const LOOSE_THRESH  = { QUAL:  50, DP: 100, ALT:  5, VAF_MIN: 0.05, VAF_MAX: 0.95, REQUIRE_PASS: false, STR_FILTER: false };
+// Panel boyutları (Mb) – konservatif
+const PANEL_MB_LUNG  = 0.279;   // CDHS-53206Z-3833
+const PANEL_MB_SOLID = 0.231;   // CDHS-53205Z-3204
 
-/** ===========================================================
- *  MENÜ – Coverage kodunuzdaki menüden ayrı bir menü oluşturur
- *  Not: Aynı projede birden çok onOpen() olabilir; ikisi de çalışır.
- *  ===========================================================
- */
+// Rapor formatı
+const MAX_LIST_VARIANTS = 120;  // rapora liste düşülecek maksimum varyant sayısı
+
+// Klinik mod kriterleri
+const KEEP_IMPACTS = new Set(['missense','nonsense','stop gain','stop_gain','frameshift','splice site','splice_site']);
+const EXCLUDE_CLASSES = new Set(['benign','likely benign','likely_benign']);
+const EXCLUDE_REGIONS = [/intronic/i, /utr/i, /promoter/i, /ncrna/i];  // splice varsa yine tutulur
+const GNOMAD_MAX_AF = 0.001; // >= ise klinikten çıkar
+
+/////////////////////////////// MENÜ /////////////////////////////////////////////////
+
 function onOpen(){
-  try{
-    SpreadsheetApp.getUi()
-      .createMenu('TMB')
-      .addItem('TMB (Lung MSI • CDHS-53206Z-3833)', 'tmbLung')
-      .addItem('TMB (Solid • CDHS-53205Z-3204)',    'tmbSolid')
-      .addToUi();
-  }catch(e){
-    // Sessiz geç
-  }
+  SpreadsheetApp.getUi()
+    .createMenu('TMB')
+    .addItem('Akciğer paneli (teknik TMB)', 'menu_lung_tech')
+    .addItem('Akciğer paneli (klinik TMB)', 'menu_lung_clin')
+    .addSeparator()
+    .addItem('Solid panel (teknik TMB)', 'menu_solid_tech')
+    .addItem('Solid panel (klinik TMB)', 'menu_solid_clin')
+    .addSeparator()
+    .addItem('Son TBM çıktısını temizle', 'menu_clear_tbm')
+    .addToUi();
 }
 
-/** İki buton **/
-function tmbLung(){ runTmb_(CONST_LUNG_MB,  'Akciğer (CDHS-53206Z-3833)'); }
-function tmbSolid(){ runTmb_(CONST_SOLID_MB, 'Solid (CDHS-53205Z-3204)'); }
+function menu_lung_tech(){ runTMBForActiveSheet_(PANEL_MB_LUNG, 'Akciğer (CDHS-53206Z-3833)', /*clinical*/false); }
+function menu_lung_clin(){ runTMBForActiveSheet_(PANEL_MB_LUNG, 'Akciğer (CDHS-53206Z-3833)', /*clinical*/true ); }
+function menu_solid_tech(){ runTMBForActiveSheet_(PANEL_MB_SOLID, 'Solid (CDHS-53205Z-3204)', /*clinical*/false); }
+function menu_solid_clin(){ runTMBForActiveSheet_(PANEL_MB_SOLID, 'Solid (CDHS-53205Z-3204)', /*clinical*/true ); }
 
-/** ===========================================================
- *  BAŞLIK EŞLEME – Qiagen/CLC CSV için esnek karşılıklar
- *  (sütun adları küçük farklarla değişebilir)
- *  ===========================================================
- */
-function headerMap_(headers){
-  const norm = headers.map(h => (h||'').toString().trim().toLowerCase());
+function menu_clear_tbm(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName('tbm') || ss.insertSheet('tbm');
+  sh.clear();
+  sh.getRange(1,1).setValue('TBM çıktısı temizlendi.');
+}
 
-  function idxOf(aliases){
-    for (let a of aliases){
-      const j = norm.indexOf(a.toLowerCase());
-      if (j >= 0) return j;
+//////////////////////////////// KALBİ ////////////////////////////////////////////////
+
+function runTMBForActiveSheet_(panelMb, panelLabel, clinicalMode){
+  const src = SpreadsheetApp.getActiveSheet();
+  const ss  = SpreadsheetApp.getActiveSpreadsheet();
+  const out = ss.getSheetByName('tbm') || ss.insertSheet('tbm');
+
+  // CSV başlık çözümle
+  const values = src.getDataRange().getValues();
+  if (!values || values.length < 2){
+    uiWarn_('Aktif sayfada veri yok.');
+    return;
+  }
+  const idx = headerIndexMap_(values[0]);
+  const need = ['chrom','pos','ref','alt'];
+  const miss = need.filter(k => idx[k] < 0);
+  if (miss.length){
+    uiWarn_('Beklenen VCF/CSV sütunları bulunamadı (Chromosome, Position, Reference Allele, Sample Allele). Eksik: ' + miss.join(', '));
+    return;
+  }
+
+  // İki profil: Strict & Loose (her ikisini hesaplayıp rapora koyuyoruz)
+  const strict = {
+    name: 'Sıkı',
+    qualMin: 200, dpMin: 300, altMin: 15,
+    vafMin: 0.10, vafMax: 0.80,
+    requirePass: true,
+    dropSTR: true
+  };
+  const loose = {
+    name: 'Gevşek (teknik)',
+    qualMin: 50, dpMin: 100, altMin: 5,
+    vafMin: 0.05, vafMax: 0.95,
+    requirePass: false,
+    dropSTR: false
+  };
+
+  const sampleName = src.getName();
+  const today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+
+  const resultStrict = countQualified_(values, idx, strict, clinicalMode);
+  const resultLoose  = countQualified_(values, idx, loose,  clinicalMode);
+
+  // Rapor metni
+  const report = buildReport_({
+    date: today,
+    sample: sampleName,
+    sheet: sampleName,
+    panelLabel,
+    panelMb,
+    results: [resultStrict, resultLoose],
+    clinicalMode,
+    topList: pickTopList_(values, idx, resultStrict.passedRows, MAX_LIST_VARIANTS)
+  });
+
+  // Yaz
+  out.clear();
+  writeMultiline_(out, 1, 1, report);
+  out.setColumnWidths(1, 1, 760);
+  SpreadsheetApp.flush();
+  uiInfo_('TMB raporu "tbm" sayfasına yazıldı.');
+}
+
+/////////////////////////////// SAYIM & FİLTRELER /////////////////////////////////////
+
+function countQualified_(values, idx, prof, clinicalMode){
+  let count = 0;
+  const passedRows = [];
+
+  for (let r=1; r<values.length; r++){
+    const row = values[r];
+    if (!row || row.length === 0) continue;
+
+    // Zorunlu alanlar
+    const chrom = str_(row[idx.chrom]);
+    const pos   = toInt_(row[idx.pos]);
+    const ref   = str_(row[idx.ref]);
+    const alt   = str_(row[idx.alt]);
+
+    if (!chrom || isNaN(pos) || !ref){ continue; } // ALT boş (ör. del/ins gösterimi) olabilir; yine de sayımda yer vereceğiz.
+
+    // Metri̇kler
+    const qual = (idx.qual >= 0) ? toNumber_(row[idx.qual]) : NaN;
+    const dp   = (idx.dp   >= 0) ? toNumber_(row[idx.dp])   : NaN;
+    let   vaf  = (idx.vaf  >= 0) ? toNumber_(row[idx.vaf])  : NaN;
+
+    // VAF yüzde mi geldi? (örn. 99.83) → 0.9983'e çevir
+    if (!isNaN(vaf) && vaf > 1) vaf = vaf / 100.0;
+
+    // ALT (AD) yoksa türet: ALT ≈ round(VAF * DP)
+    let altReads = (idx.altAd >= 0) ? toInt_(row[idx.altAd]) : NaN;
+    if (isNaN(altReads) && !isNaN(vaf) && !isNaN(dp)) altReads = Math.round(vaf * dp);
+
+    // PASS?
+    const passTxt = (idx.passFlag >= 0) ? str_(row[idx.passFlag]) : '';
+    const isPass  = /pass/i.test(passTxt);
+
+    // Eşikler
+    if (!isNaN(prof.qualMin) && !(qual >= prof.qualMin)) continue;
+    if (!isNaN(prof.dpMin)   && !(dp   >= prof.dpMin))   continue;
+    if (!isNaN(prof.altMin)  && !(altReads >= prof.altMin)) continue;
+    if (!isNaN(prof.vafMin)  && !(vaf  >= prof.vafMin))  continue;
+    if (!isNaN(prof.vafMax)  && !(vaf <= prof.vafMax))   continue;
+    if (prof.requirePass && !isPass) continue;
+
+    // Basit STR/tekrar artefakt elemesi (çok basitleştirilmiş sezgi)
+    if (prof.dropSTR){
+      const isIndel = /del|ins/i.test(str_(row[idx.varType]));
+      if (isIndel && looksLikeSTR_(ref, alt)) continue;
+    }
+
+    // Klinik mod filtreleri
+    if (clinicalMode){
+      const impact = (idx.transImpact>=0) ? row[idx.transImpact] : '';
+      const cls    = (idx.classif>=0)     ? row[idx.classif]     : '';
+      const region = (idx.region >=0)     ? row[idx.region]      : '';
+      const gmaf   = (idx.gnomad>=0)      ? toNumber_(row[idx.gnomad]) : NaN;
+
+      // Bölge kodlayan mı? (splice her zaman dahil)
+      if (!regionIsCoding_(region)) continue;
+
+      // Etki tipi uygun mu?
+      if (!isAllowedImpact_(impact)) continue;
+
+      // Benign sınıflar hariç
+      if (isExcludedClass_(cls)) continue;
+
+      // Popülasyon sık varyant hariç
+      if (!isNaN(gmaf) && gmaf >= GNOMAD_MAX_AF) continue;
+    }
+
+    count++;
+    passedRows.push(r);
+  }
+
+  return { profile: prof, count, passedRows };
+}
+
+function looksLikeSTR_(ref, alt){
+  // 1) Tek bazın 4+ tekrarı (AAAA...), 2) homopolimerik ins/del tahmini
+  const s1 = (ref||'').toString();
+  const s2 = (alt||'').toString();
+  const seq = (s1.length >= s2.length ? s1 : s2);
+  if (!seq) return false;
+  const m = seq.match(/^([ACGT])\1{3,}$/i); // >=4 aynı nükleotid
+  return !!m;
+}
+
+function regionIsCoding_(region){
+  const txt = str_(region);
+  if (/splice/i.test(txt)) return true;
+  for (let i=0;i<EXCLUDE_REGIONS.length;i++){
+    if (EXCLUDE_REGIONS[i].test(txt)) return false;
+  }
+  return true;
+}
+
+function isAllowedImpact_(impact){
+  const s = str_(impact).toLowerCase();
+  // "missense; synonymous" gibi birleşik hücreler olabilir
+  for (const k of KEEP_IMPACTS){
+    if (s.indexOf(k) >= 0) return true;
+  }
+  return false;
+}
+
+function isExcludedClass_(cls){
+  const s = str_(cls).toLowerCase();
+  for (const k of EXCLUDE_CLASSES){
+    if (s.indexOf(k) >= 0) return true;
+  }
+  return false;
+}
+
+//////////////////////////////// RAPORLA ///////////////////////////////////////////////
+
+function buildReport_({date, sample, sheet, panelLabel, panelMb, results, clinicalMode, topList}){
+  const lines = [];
+  lines.push('*** TMB RAPORU ***');
+  lines.push('Tarih: ' + date);
+  lines.push('Örnek: ' + sample);
+  lines.push('Kaynak sayfa: ' + sheet);
+  lines.push('Panel: ' + panelLabel + ' (Qiagen/CLC CSV)');
+  lines.push('Panel boyutu (Mb): ' + panelMb.toFixed(3));
+  lines.push('');
+
+  results.forEach(r => {
+    const tag = '[' + r.profile.name + (clinicalMode ? ' – KLINIK' : '') + ']';
+    lines.push(tag + ' Filtre Eşikleri: QUAL≥' + r.profile.qualMin + ', DP≥' + r.profile.dpMin + ', ALT≥' + r.profile.altMin +
+               ', VAF≥' + r.profile.vafMin.toFixed(2) + '–' + r.profile.vafMax.toFixed(2));
+    lines.push(tag + ' Filter PASS şartı: ' + (r.profile.requirePass ? 'Evet' : 'Hayır'));
+    lines.push(tag + ' STR artefakt elemesi: ' + (r.profile.dropSTR ? 'Evet' : 'Hayır'));
+    lines.push(tag + ' Nitelikli varyant sayısı: ' + r.count);
+    const tmb = (panelMb > 0) ? (r.count / panelMb) : 0;
+    lines.push(tag + ' TMB (varyant/Mb): ' + tmb.toFixed(2));
+    lines.push('');
+  });
+
+  lines.push('Notlar:');
+  if (clinicalMode){
+    lines.push('- Bu mod, klinik raporlanabilir TMB’yi hedefler: kodlayan nonsynonymous SNV/indel ve splice; synonymous/intronic/UTR/promoter hariç; benign/likely benign ve gnomAD≥'+GNOMAD_MAX_AF+' dışlanır.');
+  } else {
+    lines.push('- Bu değer panel tabanlı teknik/ham TMB’dir; klinik raporlama için doğrulanmış panel Mb ve eşikler esas alınmalıdır.');
+  }
+  lines.push('- CSV’de PASS/AD/VAF sütunları yoksa, VAF ve DP’den ALT≈VAF×DP türetimi yapılır.');
+  lines.push('- Eşleşik normal yoksa yüksek VAF (~%50/~%100) varyantlar germline olabilir; klinik yorumda dikkate alınmalıdır.');
+  lines.push('');
+
+  if (topList && topList.length){
+    lines.push('CHROM\tPOS\tREF\tALT');
+    topList.forEach(v => {
+      lines.push([v.chrom, v.pos, v.ref, v.alt].join('\t'));
+    });
+  }
+
+  return lines.join('\n');
+}
+
+function pickTopList_(values, idx, passedRows, N){
+  const out = [];
+  const take = Math.min(N, passedRows.length);
+  for (let i=0;i<take;i++){
+    const r = passedRows[i];
+    const row = values[r];
+    out.push({
+      chrom: str_(row[idx.chrom]),
+      pos: toInt_(row[idx.pos]),
+      ref: str_(row[idx.ref]),
+      alt: str_(row[idx.alt])
+    });
+  }
+  return out;
+}
+
+///////////////////////////////// YARDIMCILAR //////////////////////////////////////////
+
+function uiWarn_(msg){ SpreadsheetApp.getUi().alert('TMB: ' + msg); }
+function uiInfo_(msg){ SpreadsheetApp.getUi().alert('TMB: ' + msg); }
+
+function writeMultiline_(sheet, r, c, text){
+  const lines = text.split('\n');
+  const rng = sheet.getRange(r, c, lines.length, 1);
+  const vals = lines.map(s => [s]);
+  rng.setValues(vals);
+  rng.setWrap(true);
+}
+
+function str_(v){ return (v==null) ? '' : String(v); }
+function toInt_(v){
+  if (v==null || v==='') return NaN;
+  const n = Number(String(v).replace(',', '.'));
+  return Math.round(n);
+}
+function toNumber_(v){
+  if (v==null || v==='') return NaN;
+  const s = String(v).replace(',', '.');
+  const n = Number(s);
+  return isNaN(n) ? NaN : n;
+}
+
+function headerIndexMap_(headerRow){
+  const H = headerRow.map(x => (x||'').toString());
+  const L = H.map(x => x.toLowerCase().trim());
+
+  function idxOf(keys){
+    for (let k of keys){
+      const kk = k.toLowerCase();
+      // tam eşleşme
+      let i = L.indexOf(kk);
+      if (i>=0) return i;
+      // kısmi içerme (örn. "Sample Genotype Quality" ~ "Genotype Quality")
+      i = L.findIndex(t => t.indexOf(kk) >= 0);
+      if (i>=0) return i;
     }
     return -1;
   }
 
   return {
-    chrom: idxOf(['chromosome','chrom']),
-    pos: idxOf(['position','start position','pos']),
-    end: idxOf(['end position','end']),
-    ref: idxOf(['reference allele','ref']),
-    alt: idxOf(['sample allele','alt','alternate allele']),
-    varType: idxOf(['variation type','variant type','type']),
-    qual: idxOf(['call quality','qual','sample genotype quality']),
-    dp: idxOf(['read depth','depth','dp']),
-    vaf: idxOf(['allele fraction','vaf','variant allele frequency']),
-    pass: idxOf(['sample upstream filtering','filter','filters'])
+    chrom:     idxOf(['chromosome','chrom','chr']),
+    pos:       idxOf(['position','start position','pos']),
+    ref:       idxOf(['reference allele','ref']),
+    alt:       idxOf(['sample allele','alt','alternate allele']),
+    qual:      idxOf(['call quality','qual','sample genotype quality']),
+    dp:        idxOf(['read depth','dp','coverage']),
+    vaf:       idxOf(['allele fraction','variant allele fraction','vaf']),
+    altAd:     idxOf(['alt ad','alt count','alt reads']), // çoğu qiagen csv’de yok
+    passFlag:  idxOf(['sample upstream filtering','filter']),
+    varType:   idxOf(['variation type','var type']),
+    transImpact: idxOf(['translation impact','consequence','effect']),
+    classif:     idxOf(['classification','clinvar','interpretation']),
+    gnomad:      idxOf(['gnomad frequency','gnomad','af']),
+    region:      idxOf(['gene region','region','location'])
   };
 }
-
-/** Sayısal parse (virgül/nokta dayanıklı) */
-function toNumber_(v){
-  if (v === null || v === undefined) return NaN;
-  if (typeof v === 'number') return v;
-  const s = v.toString().replace('%','').replace(/\s/g,'').replace(',','.');
-  const n = Number(s);
-  return isNaN(n) ? NaN : n;
-}
-
-/** VAF normalizasyonu: yüzde geldiyse 0–1 aralığına çevir */
-function normalizeVaf_(raw){
-  let v = toNumber_(raw);
-  if (isNaN(v)) return NaN;
-  if (v > 1.0) v = v/100.0;  // 47.3 → 0.473
-  if (v < 0) v = 0;
-  if (v > 1) v = 1;
-  return v;
-}
-
-/** Basit STR/homopolimer sezgisi (sıkı modda kapatır) */
-function looksLikeSTR_(ref, alt){
-  // Tek bazın 3+ tekrarından oluşan küçük insersyon/delesyonları kaba ele
-  const R = (ref||'').toString().toUpperCase();
-  const A = (alt||'').toString().toUpperCase();
-  const isIndel = (R.length !== A.length);
-  if (!isIndel) return false;
-
-  function homopolymer(s){
-    if (!s || s.length < 3) return false;
-    return /^([ACGT])\1{2,}$/.test(s); // AAA, CCCC, TTTTT
-  }
-  return homopolymer(R) || homopolymer(A);
-}
-
-/** Varyantın eşiğe uyup uymadığını kontrol et */
-function passVariant_(row, idx, thresh){
-  const qual = (idx.qual>=0) ? toNumber_(row[idx.qual]) : NaN;
-  const dp   = (idx.dp>=0)   ? toNumber_(row[idx.dp])   : NaN;
-  const vaf  = (idx.vaf>=0)  ? normalizeVaf_(row[idx.vaf]) : NaN;
-
-  // ALT okun sayısı türetme: ALT ≈ VAF × DP
-  const altReads = (!isNaN(vaf) && !isNaN(dp)) ? Math.round(vaf * dp) : NaN;
-
-  // PASS/FILTER
-  let isPass = true;
-  if (idx.pass >= 0){
-    const f = (row[idx.pass]||'').toString().toLowerCase();
-    // Qiagen export’ta genelde "Pass" veya boş
-    isPass = f.indexOf('pass') >= 0 || f === '' || f === 'ok';
-  }
-
-  // STR/homopolimer elemesi (yalnızca sıkı mod)
-  const ref = (idx.ref>=0) ? row[idx.ref] : '';
-  const alt = (idx.alt>=0) ? row[idx.alt] : '';
-  if (thresh.STR_FILTER && looksLikeSTR_(ref, alt)) return {ok:false};
-
-  // Eşikler
-  if (!isNaN(thresh.QUAL) && !isNaN(qual) && qual < thresh.QUAL) return {ok:false};
-  if (!isNaN(thresh.DP)   && !isNaN(dp)   && dp   < thresh.DP)   return {ok:false};
-  if (!isNaN(thresh.ALT)  && !isNaN(altReads) && altReads < thresh.ALT) return {ok:false};
-  if (!isNaN(thresh.VAF_MIN) && !isNaN(vaf) && vaf < thresh.VAF_MIN) return {ok:false};
-  if (!isNaN(thresh.VAF_MAX) && !isNaN(vaf) && vaf > thresh.VAF_MAX) return {ok:false};
-  if (thresh.REQUIRE_PASS && !isPass) return {ok:false};
-
-  return {
-    ok: true,
-    chrom: (idx.chrom>=0)? row[idx.chrom] : '',
-    pos:   (idx.pos>=0)?   row[idx.pos]   : '',
-    ref:   ref,
-    alt:   alt,
-    qual:  qual,
-    dp:    dp,
-    vaf:   vaf,
-    altReads: altReads
-  };
-}
-
-/** TMB ana çalıştırıcı */
-function runTmb_(panelMb, panelLabel){
-  const sh = SpreadsheetApp.getActiveSheet();
-  const name = sh.getName();
-  const values = sh.getDataRange().getDisplayValues();
-
-  if (!values || values.length < 2)
-    return uiAlert_('Aktif sayfada veri yok.');
-
-  const headers = values[0];
-  const idx = headerMap_(headers);
-
-  // Minimum gereken sütunlar: Chromosome, Position, Reference/Sample Allele
-  if (idx.chrom < 0 || idx.pos < 0 || (idx.ref < 0 && idx.alt < 0)){
-    return uiAlert_('Beklenen VCF/CSV sütunları bulunamadı (Chromosome, Position, Reference/Sample Allele).');
-  }
-
-  // Her iki mod için say
-  const resStrict = [];
-  const resLoose  = [];
-
-  for (let r=1; r<values.length; r++){
-    const row = values[r];
-
-    // Sıkı
-    const s = passVariant_(row, idx, STRICT_THRESH);
-    if (s.ok) resStrict.push(s);
-
-    // Gevşek
-    const g = passVariant_(row, idx, LOOSE_THRESH);
-    if (g.ok) resLoose.push(g);
-  }
-
-  // TMB hesapları
-  const tmbStrict = (panelMb > 0) ? (resStrict.length / panelMb) : 0;
-  const tmbLoose  = (panelMb > 0) ? (resLoose.length  / panelMb) : 0;
-
-  // Çıktı sayfası
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const out = ss.getSheetByName('tbm') || ss.insertSheet('tbm');
-  out.clear();
-
-  const today = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone() || 'Europe/Istanbul', 'yyyy-MM-dd');
-
-  const lines = [];
-  lines.push('*** TMB RAPORU ***');
-  lines.push('Tarih: ' + today);
-  lines.push('Örnek: ' + name);
-  lines.push('Kaynak sayfa: ' + name);
-  lines.push('Panel: ' + panelLabel + ' (Qiagen/CLC CSV)');
-  lines.push('Panel boyutu (Mb): ' + panelMb.toFixed(3));
-  lines.push('');
-
-  lines.push('[Sıkı] Filtre Eşikleri: QUAL≥' + STRICT_THRESH.QUAL +
-             ', DP≥' + STRICT_THRESH.DP +
-             ', ALT≥' + STRICT_THRESH.ALT +
-             ', VAF≥' + STRICT_THRESH.VAF_MIN.toFixed(2) + '–' + STRICT_THRESH.VAF_MAX.toFixed(2));
-  lines.push('[Sıkı] Filter PASS şartı: ' + (STRICT_THRESH.REQUIRE_PASS ? 'Evet' : 'Hayır'));
-  lines.push('[Sıkı] STR artefakt elemesi: ' + (STRICT_THRESH.STR_FILTER ? 'Evet' : 'Hayır'));
-  lines.push('[Sıkı] Nitelikli varyant sayısı: ' + resStrict.length);
-  lines.push('[Sıkı] TMB (varyant/Mb): ' + tmbStrict.toFixed(2));
-  lines.push('');
-
-  lines.push('[Gevşek (teknik)] Filtre Eşikleri: QUAL≥' + LOOSE_THRESH.QUAL +
-             ', DP≥' + LOOSE_THRESH.DP +
-             ', ALT≥' + LOOSE_THRESH.ALT +
-             ', VAF≥' + LOOSE_THRESH.VAF_MIN.toFixed(2) + '–' + LOOSE_THRESH.VAF_MAX.toFixed(2));
-  lines.push('[Gevşek (teknik)] Filter PASS şartı: ' + (LOOSE_THRESH.REQUIRE_PASS ? 'Evet' : 'Hayır'));
-  lines.push('[Gevşek (teknik)] STR artefakt elemesi: ' + (LOOSE_THRESH.STR_FILTER ? 'Evet' : 'Hayır'));
-  lines.push('[Gevşek (teknik)] Nitelikli varyant sayısı: ' + resLoose.length);
-  lines.push('[Gevşek (teknik)] TMB (varyant/Mb): ' + tmbLoose.toFixed(2));
-  lines.push('');
-
-  lines.push('Notlar:');
-  lines.push('- TMB değerleri panel tabanlıdır; klinik raporlama için doğrulanmış panel Mb ve eşikleriniz esas alınmalıdır.');
-  lines.push('- CSV’de PASS/AD/VAF olmayabilir. Bu durumda ALT≈VAF×DP gibi türetmeler kullanılır.');
-  lines.push('- Sıkı koşul 0 dönerse, keşif amaçlı gevşek koşullu teknik TMB de referans için verilmiştir.');
-  lines.push('- Germline/benign/silent dışlama yapılmadığından, klinik karar desteği için tek başına kullanılmamalıdır.');
-
-  // Yaz
-  out.getRange(1,1,lines.length,1).setValues(lines.map(s=>[s]));
-
-  // İlk 30 nitelikli varyant (Sıkı) – özet tablo
-  const tableHead = ['CHROM','POS','REF','ALT','QUAL','DP','VAF','ALT_EST'];
-  const preview = resStrict.slice(0,30).map(v => [
-    v.chrom, v.pos, v.ref, v.alt,
-    isNaN(v.qual)? '' : v.qual,
-    isNaN(v.dp)?   '' : v.dp,
-    isNaN(v.vaf)?  '' : v.vaf.toFixed(3),
-    isNaN(v.altReads)? '' : v.altReads
-  ]);
-
-  if (preview.length){
-    const startRow = lines.length + 2;
-    out.getRange(startRow,1,1,tableHead.length).setValues([tableHead]);
-    out.getRange(startRow+1,1,preview.length,tableHead.length).setValues(preview);
-  }
-
-  out.setColumnWidths(1, 1, 520);
-  SpreadsheetApp.flush();
-  uiToast_('TMB tamam: Sıkı=' + resStrict.length + ' ('
-           + tmbStrict.toFixed(2) + '/Mb), Gevşek=' + resLoose.length + ' ('
-           + tmbLoose.toFixed(2) + '/Mb).');
-}
-
-/** Küçük yardımcılar */
-function uiAlert_(msg){ SpreadsheetApp.getUi().alert(msg); }
-function uiToast_(msg){ SpreadsheetApp.getActive().toast(msg, 'TMB', 6); }
