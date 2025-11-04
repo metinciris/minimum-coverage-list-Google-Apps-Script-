@@ -1,28 +1,40 @@
 /**************************************************************
- *  TMB Hesabı (Qiagen/CLC CSV odaklı) – Menü: "TMB Hesabı"
- *  Çakışmayı önlemek için onOpen yazmıyoruz.
- *  İlk kullanımda Script Editor'dan addTMBMenu() -> Run edin.
- *  qiAgen panel çıktısında tüm alanlar seçilmiş csv eksport edin
- *  --- ELLE DEĞİŞTİRİLEBİLİR ALANLAR (BAŞLANGIÇ) ---
+ *  TMB Hesabı (Qiagen/CLC CSV) panelden export tümü seçili csv çıktısını al– Menü: "TMB Hesabı"
+ *  onOpen ÇAKIŞMASI YOK; menüyü addTMBMenu() ile ekliyoruz.
  **************************************************************/
 
-// PANEL boyutları (Mb) – KENDİ DOĞRULANMIŞ DEĞERLERİNİZİ YAZIN
+// ================== ELLE DÜZENLE (Panel Mb) ==================
 const PANEL_MB_LUNG  = 1.200; // TODO: kesin değeri yazın
 const PANEL_MB_SOLID = 1.200; // TODO: kesin değeri yazın
+// =============================================================
 
-// Varsayılan (korumacı) filtre eşikleri
-const QUAL_MIN   = 200.0; // kalite
-const DP_MIN     = 300;   // toplam derinlik
-const ALT_MIN    = 15;    // alternatif okuma sayısı
-const VAF_MIN    = 0.10;
-const VAF_MAX    = 0.80;
-const REQUIRE_PASS = true;
-const STR_FILTER   = true; // homopolimer/STR tipi adayları ele
+// ======= SIKI AYARLAR (öncelikli deneme / daha seçici) =======
+const STRICT = {
+  QUAL_MIN:   200.0,
+  DP_MIN:     300,
+  ALT_MIN:    15,
+  VAF_MIN:    0.10,
+  VAF_MAX:    0.80,
+  REQUIRE_PASS: true,
+  STR_FILTER:   true,
+  LABEL: "Sıkı"
+};
 
-// Rapora yazılacak ilk 20 varyant liste sınırı
+// ======= GEVŞEK AYARLAR (fallback / keşif amaçlı) ============
+const RELAXED = {
+  QUAL_MIN:   50.0,
+  DP_MIN:     100,
+  ALT_MIN:    5,
+  VAF_MIN:    0.05,
+  VAF_MAX:    0.95,
+  REQUIRE_PASS: false,
+  STR_FILTER:   false,
+  LABEL: "Gevşek (teknik)"
+};
+
 const TOP_N_TO_LIST = 20;
 
-// CSV başlık aliasları (Qiagen/CLC değişimlerine dayanıklı)
+// CSV başlık aliasları
 const HEADER_ALIASES = {
   chrom:        ["Chromosome","chr","#CHROM","CHROM"],
   pos:          ["Start Position","POS","Position","Start position","Start"],
@@ -33,18 +45,12 @@ const HEADER_ALIASES = {
   dp:           ["Read Depth","DP","Coverage","Total Read Count","Total Read depth"],
   ad:           ["AD","Allele Depth","Sample allele depth","Allelic Depth"],
   vaf:          ["VAF","Variant Allele Frequency","Allele Frequency","AF"],
-  // Qiagen CSV’de ins/del ayrı kolonlarda gelebilir:
   ins:          ["Inserted Bases","Inserted base(s)","Insertion"],
   del:          ["Deleted Bases","Deleted base(s)","Deletion"],
-  // Bazen tek hücrede "A(123)/G(45)" benzeri sayım da olabilir:
   alleleCounts: ["Allele read counts","Allele Read Counts"]
 };
 
-/**************************************************************
- *  --- ELLE DEĞİŞTİRİLEBİLİR ALANLAR (BİTİŞ) ---
- **************************************************************/
-
-/** Menüyü ekler (coverage.gs ile ÇAKIŞMAZ, onOpen yazmıyoruz) */
+/** Menüyü ekler (coverage.gs ile çakışmaz) */
 function addTMBMenu(){
   const ui = SpreadsheetApp.getUi();
   ui.createMenu('TMB Hesabı')
@@ -53,54 +59,29 @@ function addTMBMenu(){
     .addToUi();
 }
 
-/** Menü fonksiyonları */
-function tmbLung(){  computeTMBForActiveSheet_("Akciğer (Qiagen/CLC CSV)", PANEL_MB_LUNG); }
-function tmbSolid(){ computeTMBForActiveSheet_("Solid (Qiagen/CLC CSV)",   PANEL_MB_SOLID); }
+function tmbLung(){  runTMB_("Akciğer (Qiagen/CLC CSV)", PANEL_MB_LUNG); }
+function tmbSolid(){ runTMB_("Solid (Qiagen/CLC CSV)",   PANEL_MB_SOLID); }
 
-/** Aktif sayfadaki CSV’den TMB hesapla ve "tbm" sayfasına rapor yaz */
-function computeTMBForActiveSheet_(panelName, panelMb){
+/** Ana akış: önce SIKI, sonuç 0 ise GEVŞEK hesapla; raporu yaz */
+function runTMB_(panelName, panelMb){
   try{
     const sh = SpreadsheetApp.getActiveSheet();
     const values = sh.getDataRange().getValues();
-    if (!values || values.length < 2)
-      throw new Error("Aktif sayfada veri yok.");
+    if (!values || values.length < 2) throw new Error("Aktif sayfada veri yok.");
 
-    // Başlık eşlemesi
     const header = (values[0] || []).map(x => (x||"").toString().trim());
     const idx = buildHeaderIndexMap_(header, HEADER_ALIASES);
-
-    // CSV doğrulaması (en azından CHROM & POS olmalı)
-    if (idx.chrom < 0 || idx.pos < 0)
+    if (idx.chrom < 0 || idx.pos < 0){
       throw new Error('Beklenen CSV sütunları eksik: en az "Chromosome" ve "Start Position" gerekir.');
-
-    // Satırları dolaş ve aday varyantları çıkar
-    const bestByLocus = new Map(); // "chr:pos" -> kayıt (en iyi DP>QUAL)
-    for (let r=1; r<values.length; r++){
-      const row = values[r];
-      const parsed = parseVariantRow_(row, idx);
-      if (!parsed) continue; // satırdan varyant üretilemedi
-
-      // Filtreler
-      if (REQUIRE_PASS && parsed.filter && parsed.filter.toString().toUpperCase() !== "PASS") continue;
-      if (isNaN(parsed.qual) || parsed.qual < QUAL_MIN) continue;
-      if (isNaN(parsed.dp)   || parsed.dp   < DP_MIN)   continue;
-      if (isNaN(parsed.alt)  || parsed.alt  < ALT_MIN)  continue;
-      if (isNaN(parsed.vaf)  || parsed.vaf  < VAF_MIN || parsed.vaf > VAF_MAX) continue;
-      if (STR_FILTER && isLikelySTR_(parsed.ref, parsed.altAllele)) continue;
-
-      // Lokus tekilleştirme (aynı CHROM:POS -> en iyi DP, eşitse QUAL)
-      const key = parsed.chrom + ":" + parsed.pos;
-      if (!bestByLocus.has(key)){
-        bestByLocus.set(key, parsed);
-      } else {
-        const prev = bestByLocus.get(key);
-        const better = (parsed.dp > prev.dp) || (parsed.dp === prev.dp && parsed.qual > prev.qual);
-        if (better) bestByLocus.set(key, parsed);
-      }
     }
 
-    const qualified = Array.from(bestByLocus.values());
-    const tmb = (panelMb && panelMb > 0) ? (qualified.length / panelMb) : null;
+    // 1) SIKI koş
+    const strictRes = collectQualified_(values, idx, STRICT);
+    // 2) 0 ise GEVŞEK koş
+    let relaxedRes = null;
+    if (strictRes.qualified.length === 0){
+      relaxedRes = collectQualified_(values, idx, RELAXED);
+    }
 
     // Raporu yaz
     writeTmbReportSheet_("tbm", {
@@ -109,24 +90,105 @@ function computeTMBForActiveSheet_(panelName, panelMb){
       sourceSheet: sh.getName(),
       panelName: panelName,
       panelMb: panelMb,
-      thresholds: `QUAL≥${QUAL_MIN}, DP≥${DP_MIN}, ALT≥${ALT_MIN}, VAF≥${VAF_MIN.toFixed(2)}–${VAF_MAX.toFixed(2)}`,
-      requirePass: REQUIRE_PASS,
-      strFilter: STR_FILTER,
-      qualifiedCount: qualified.length,
-      tmb: tmb,
-      topList: qualified
-        .sort((a,b)=> (b.dp - a.dp) || (b.qual - a.qual))
-        .slice(0, TOP_N_TO_LIST)
+      strict: buildReportBlock_(strictRes, panelMb, STRICT),
+      relaxed: relaxedRes ? buildReportBlock_(relaxedRes, panelMb, RELAXED) : null
     });
 
-    SpreadsheetApp.getUi().alert("TMB hesabı tamamlandı: " + (tmb!=null ? tmb.toFixed(2) : "-") + " (variants/Mb). Rapora 'tbm' sayfasından bakabilirsiniz.");
+    const msg = (strictRes.qualified.length > 0)
+      ? `TMB (Sıkı): ${(strictRes.tmb(panelMb)).toFixed(2)}`
+      : (relaxedRes && relaxedRes.qualified.length > 0)
+          ? `Sıkı=0 çıktı; Gevşek (teknik) TMB: ${(relaxedRes.tmb(panelMb)).toFixed(2)}`
+          : `Sıkı=0, Gevşek=0 (veri eşiklere uymuyor).`;
+    SpreadsheetApp.getUi().alert("Tamam: " + msg);
 
   } catch(err){
     SpreadsheetApp.getUi().alert("Hata: " + err.message);
   }
 }
 
-/** Başlık alias eşlemesi -> index haritası */
+/** Tek koşum: satırları parse et, filtrele, teşhis sayımlarını topla */
+function collectQualified_(values, idx, conf){
+  const bestByLocus = new Map(); // chr:pos -> record (en iyi dp→qual)
+  const diag = {
+    totalRows: values.length-1,
+    parsedOk: 0,
+    dropNoALT: 0,
+    dropPASS: 0,
+    dropQUAL: 0,
+    dropDP:   0,
+    dropALT:  0,
+    dropVAF:  0,
+    dropSTR:  0
+  };
+
+  for (let r=1; r<values.length; r++){
+    const parsed = parseVariantRow_(values[r], idx);
+    if (!parsed){ continue; }
+
+    diag.parsedOk++;
+
+    // ALT/VAF/DP eksiklikleri (hesaplanabilen her şeyi hesaplıyoruz)
+    // 1) PASS
+    if (conf.REQUIRE_PASS){
+      const f = (parsed.filter || "").toString().trim().toUpperCase();
+      if (f !== "PASS"){ diag.dropPASS++; continue; }
+    }
+
+    // 2) QUAL
+    if (isNaN(parsed.qual) || parsed.qual < conf.QUAL_MIN){ diag.dropQUAL++; continue; }
+
+    // 3) DP
+    if (isNaN(parsed.dp)   || parsed.dp   < conf.DP_MIN){ diag.dropDP++; continue; }
+
+    // 4) ALT
+    if (isNaN(parsed.alt)  || parsed.alt  < conf.ALT_MIN){ diag.dropALT++; continue; }
+
+    // 5) VAF
+    if (isNaN(parsed.vaf) || parsed.vaf < conf.VAF_MIN || parsed.vaf > conf.VAF_MAX){ diag.dropVAF++; continue; }
+
+    // 6) STR
+    if (conf.STR_FILTER && isLikelySTR_(parsed.ref, parsed.altAllele)){ diag.dropSTR++; continue; }
+
+    // 7) ALT gerçekten hiç üretilemediyse (nadiren)
+    if (isNaN(parsed.alt)){ diag.dropNoALT++; continue; }
+
+    const key = parsed.chrom + ":" + parsed.pos;
+    const prev = bestByLocus.get(key);
+    if (!prev){
+      bestByLocus.set(key, parsed);
+    } else {
+      const better = (parsed.dp > prev.dp) || (parsed.dp === prev.dp && parsed.qual > prev.qual);
+      if (better) bestByLocus.set(key, parsed);
+    }
+  }
+
+  const qualified = Array.from(bestByLocus.values());
+  const tmb = (panelMb) => (panelMb && panelMb>0) ? (qualified.length / panelMb) : NaN;
+
+  // İlk N için sıralı
+  const topList = qualified
+    .slice()
+    .sort((a,b)=> (b.dp - a.dp) || (b.qual - a.qual))
+    .slice(0, TOP_N_TO_LIST);
+
+  return { qualified, topList, diag, conf, tmb };
+}
+
+/** Rapor bloğu (metin + liste başlığı + top N satırlar) */
+function buildReportBlock_(res, panelMb, conf){
+  return {
+    label: conf.LABEL,
+    thresholds: `QUAL≥${conf.QUAL_MIN}, DP≥${conf.DP_MIN}, ALT≥${conf.ALT_MIN}, VAF≥${conf.VAF_MIN.toFixed(2)}–${conf.VAF_MAX.toFixed(2)}`,
+    requirePass: conf.REQUIRE_PASS,
+    strFilter: conf.STR_FILTER,
+    qualifiedCount: res.qualified.length,
+    tmbValue: (panelMb && panelMb>0) ? (res.qualified.length / panelMb) : NaN,
+    topList: res.topList,
+    diag: res.diag
+  };
+}
+
+/** Başlık eşlemesi -> index haritası */
 function buildHeaderIndexMap_(headerRow, aliases){
   const toIndex = (name) => headerRow.findIndex(h => h.toLowerCase() === name.toLowerCase());
   const map = {};
@@ -142,19 +204,16 @@ function buildHeaderIndexMap_(headerRow, aliases){
   return map;
 }
 
-/** Qiagen CSV satırı -> normalize edilmiş varyant kaydı */
+/** CSV satırı -> normalize varyant */
 function parseVariantRow_(row, idx){
-  // Zorunlu alanlar
   const chrom = safeCell_(row, idx.chrom);
   const pos   = toNumber_(row[idx.pos]);
-
   if (!chrom || isNaN(pos)) return null;
 
-  // REF / ALT temel değerleri
   let ref = safeCell_(row, idx.ref);
   let altAllele = safeCell_(row, idx.alt);
 
-  // ALT boşsa ins/del kolonlarından üret
+  // ALT boşsa ins/del’den üret
   if (!altAllele){
     const insVal = safeCell_(row, idx.ins);
     const delVal = safeCell_(row, idx.del);
@@ -162,34 +221,30 @@ function parseVariantRow_(row, idx){
     else if (insVal){ ref = "-"; altAllele = insVal; }
   }
 
-  // Bazı CSV’lerde allele sayıları tek hücrede olabilir (örn. "A(120);G(30)")
-  // AD / ALT hesaplaması
+  // DP / ALT / VAF türetme
   let dp = toNumber_(row[idx.dp]);
   let altCount = null;
 
-  // 1) AD kolonundan (örn. "120,30" ya da "ref,alt")
+  // AD: "ref,alt"
   if (idx.ad >= 0){
     const adRaw = (row[idx.ad]||"").toString();
     const nums = adRaw.split(/[;,\s\/\|]+/).map(x => Number(x)).filter(x => !isNaN(x));
     if (nums.length >= 2){
-      // varsayım: [ref, alt, ...]
       const refAD = nums[0], altAD = nums[1];
-      if (!isNaN(refAD) && !isNaN(altAD)){
-        altCount = Number(altAD);
-        if (isNaN(dp) || dp <= 0){
-          const sum = nums.reduce((a,b)=>a+b,0);
-          if (!isNaN(sum) && sum > 0) dp = sum;
-        }
+      altCount = Number(altAD);
+      if (isNaN(dp) || dp <= 0){
+        const sum = nums.reduce((a,b)=>a+b,0);
+        if (!isNaN(sum) && sum > 0) dp = sum;
       }
     }
   }
 
-  // 2) alleleCounts kolonundan (örn. "A(120) G(30)")
+  // Allele read counts: "A(120) G(30)" vb.
   if (altCount == null && idx.alleleCounts >= 0){
     const countsRaw = (row[idx.alleleCounts]||"").toString();
-    const matches = countsRaw.match(/\((\d+)\)/g); // parantez içindeki sayılar
+    const matches = countsRaw.match(/\((\d+)\)/g);
     if (matches && matches.length >= 2){
-      const nums = matches.map(s => Number(s.replace(/[()]/g,'') )).filter(x=>!isNaN(x));
+      const nums = matches.map(s => Number(s.replace(/[()]/g,''))).filter(x=>!isNaN(x));
       if (nums.length >= 2){
         altCount = nums[1];
         if (isNaN(dp) || dp <= 0){
@@ -200,27 +255,24 @@ function parseVariantRow_(row, idx){
     }
   }
 
-  // 3) VAF varsa ALT ≈ round(VAF*DP)
+  // VAF varsa ALT ≈ round(VAF*DP)
   let vaf = (idx.vaf>=0) ? toNumber_(row[idx.vaf]) : NaN;
-  if (!isNaN(vaf) && (vaf > 1.0)) vaf = vaf / 100.0; // % ise 0-1’e çevir
+  if (!isNaN(vaf) && vaf > 1.0) vaf = vaf / 100.0; // % ise 0-1
+
   if ((altCount == null || isNaN(altCount)) && !isNaN(vaf) && !isNaN(dp) && dp > 0){
     altCount = Math.round(vaf * dp);
   }
 
-  // 4) Hiçbiri yoksa, ALT_COUNT belirsiz kalabilir
-  if (altCount == null || isNaN(altCount)) altCount = NaN;
+  if (altCount == null) altCount = NaN;
 
-  // QUAL / FILTER
   const qual = (idx.qual>=0) ? toNumber_(row[idx.qual]) : NaN;
   const filter = (idx.filter>=0) ? (row[idx.filter]||"").toString().trim() : "";
 
-  // VAF’ı yeniden tutarlı hesapla (eğer mümkünse)
   let vafFinal = (!isNaN(vaf)) ? vaf : NaN;
   if (isNaN(vafFinal) && !isNaN(altCount) && !isNaN(dp) && dp>0){
     vafFinal = altCount / dp;
   }
 
-  // Normalize alanlar
   return {
     chrom: chrom.toString().replace(/^chr/i, ''),
     pos: Number(pos),
@@ -240,69 +292,109 @@ function isLikelySTR_(ref, alt){
   const s2 = (alt||"").toString().replace(/-/g,'');
   const s = (s1.length >= s2.length) ? s1 : s2;
   if (!s) return false;
-  // tek bazın ≥3 tekrarı (AAA, TTTT, vb.)
   if (/^(A+|T+|C+|G+)$/.test(s) && s.length >= 3) return true;
-  // ref==alt veya çok kısa/sıfır içerik
   if (s1 === s2) return true;
   return false;
 }
 
-/** Hücre okuma yardımcıları */
+/** Yardımcılar */
 function safeCell_(row, idx){ return (idx>=0 ? (row[idx]||"").toString().trim() : ""); }
 function toNumber_(v){
   if (v === null || v === undefined) return NaN;
   if (typeof v === "number") return v;
-  const s = v.toString().replace(',','.');
+  const s = v.toString().replace(',', '.');
   const n = Number(s);
   return isNaN(n) ? NaN : n;
 }
 
-/** "tbm" sayfasına rapor ve liste yaz */
-function writeTmbReportSheet_(sheetName, info){
+/** "tbm" sayfasına RAPOR + TEŞHİS + LİSTE yaz */
+function writeTmbReportSheet_(sheetName, all){
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
   sh.clear();
 
-  // Başlık blok (A1: tek hücre)
   const lines = [
     "*** TMB RAPORU ***",
-    "Tarih: " + info.today,
-    "Örnek: " + info.sampleName,
-    "Kaynak sayfa: " + info.sourceSheet,
-    "Panel: " + info.panelName,
-    "Panel boyutu (Mb): " + (info.panelMb != null ? info.panelMb.toFixed(3) : "-"),
-    "Filtre Eşikleri: " + info.thresholds,
-    "Filter PASS şartı: " + (info.requirePass ? "Evet" : "Hayır"),
-    "STR artefakt elemesi: " + (info.strFilter ? "Evet" : "Hayır"),
-    "",
-    "Nitelikli varyant sayısı: " + info.qualifiedCount,
-    "TMB (varyant/Mb): " + (info.tmb != null ? info.tmb.toFixed(2) : "-"),
-    "",
-    "Notlar:",
-    "- Bu değer panel tabanlı, filtrelenmiş teknik TMB’dir (variants/Mb).",
-    "- Klinik raporlama için doğrulanmış panel Mb ve eşiklerinizi esas alın.",
-    "- CSV’de PASS/AD/VAF bulunmuyorsa, muhafazakâr varsayımlar (ALT≈VAF×DP vb.) kullanılmış olabilir.",
-    "- Germline/benign/silent dışlama yapılmadığından, klinik karar desteği için tek başına kullanılmamalıdır."
+    "Tarih: " + all.today,
+    "Örnek: " + all.sampleName,
+    "Kaynak sayfa: " + all.sourceSheet,
+    "Panel: " + all.panelName,
+    "Panel boyutu (Mb): " + (all.panelMb != null ? all.panelMb.toFixed(3) : "-"),
+    ""
   ];
+
+  // SIKI blok
+  lines.push(`[${all.strict.label}] Filtre Eşikleri: ${all.strict.thresholds}`);
+  lines.push(`[${all.strict.label}] Filter PASS şartı: ${all.strict.requirePass ? "Evet" : "Hayır"}`);
+  lines.push(`[${all.strict.label}] STR artefakt elemesi: ${all.strict.strFilter ? "Evet" : "Hayır"}`);
+  lines.push(`[${all.strict.label}] Nitelikli varyant sayısı: ${all.strict.qualifiedCount}`);
+  lines.push(`[${all.strict.label}] TMB (varyant/Mb): ` + (isNaN(all.strict.tmbValue) ? "-" : all.strict.tmbValue.toFixed(2)));
+  lines.push("");
+
+  // GEVŞEK blok (varsa)
+  if (all.relaxed){
+    lines.push(`[${all.relaxed.label}] Filtre Eşikleri: ${all.relaxed.thresholds}`);
+    lines.push(`[${all.relaxed.label}] Filter PASS şartı: ${all.relaxed.requirePass ? "Evet" : "Hayır"}`);
+    lines.push(`[${all.relaxed.label}] STR artefakt elemesi: ${all.relaxed.strFilter ? "Evet" : "Hayır"}`);
+    lines.push(`[${all.relaxed.label}] Nitelikli varyant sayısı: ${all.relaxed.qualifiedCount}`);
+    lines.push(`[${all.relaxed.label}] TMB (varyant/Mb): ` + (isNaN(all.relaxed.tmbValue) ? "-" : all.relaxed.tmbValue.toFixed(2)));
+    lines.push("");
+  }
+
+  // Notlar
+  lines.push("Notlar:");
+  lines.push("- TMB değerleri panel tabanlıdır; klinik raporlama için doğrulanmış panel Mb ve eşikleriniz esas alınmalıdır.");
+  lines.push("- CSV’de PASS/AD/VAF yoksa, ALT≈VAF×DP vb. türetmeler yapılmış olabilir.");
+  lines.push("- Sıkı koşul 0 dönerse, keşif amaçlı gevşek koşullu teknik TMB de hesaplanır.");
+  lines.push("- Germline/benign/silent dışlama yapılmadığından, klinik karar desteği için tek başına kullanılmamalıdır.");
+  lines.push("");
+
   sh.getRange(1,1).setValue(lines.join("\n"));
   sh.getRange(1,1).setWrap(true);
 
-  // Başlık satırı (liste) – B sütunundan itibaren
-  const header = ["CHROM","POS","REF","ALT","QUAL","DP","ALT_AD","VAF"];
-  sh.getRange(1,3,1,header.length).setValues([header]);
+  // Teşhis (A sütununda devam)
+  let rowStart = 2 + (lines.length); // yaklaşık; basit yerleşim
+  rowStart = Math.max(10, lines.length + 2);
 
-  // İlk N nitelikli varyantı yaz
-  const rows = info.topList.map(r => [
-    r.chrom, r.pos, r.ref, r.altAllele,
-    isNaN(r.qual) ? "" : r.qual,
-    isNaN(r.dp)   ? "" : r.dp,
-    isNaN(r.alt)  ? "" : r.alt,
-    (isNaN(r.vaf) ? "" : r.vaf.toFixed(3))
-  ]);
-  if (rows.length){
-    sh.getRange(2,3,rows.length, header.length).setValues(rows);
+  const diagHeader = [
+    ["", "Toplam Satır", "Parse OK", "PASS", "QUAL", "DP", "ALT", "VAF", "STR/Homopol", "ALT yok"]
+  ];
+  const dS = all.strict.diag, dR = all.relaxed ? all.relaxed.diag : null;
+  const diagStrict = [
+    ["[Sıkı] Elenen sayıları", dS.totalRows, dS.parsedOk, dS.dropPASS, dS.dropQUAL, dS.dropDP, dS.dropALT, dS.dropVAF, dS.dropSTR, dS.dropNoALT]
+  ];
+  const diagRelaxed = dR ? [
+    ["[Gevşek] Elenen sayıları", dR.totalRows, dR.parsedOk, dR.dropPASS, dR.dropQUAL, dR.dropDP, dR.dropALT, dR.dropVAF, dR.dropSTR, dR.dropNoALT]
+  ] : [];
+
+  sh.getRange(rowStart,1,1,diagHeader[0].length).setValues(diagHeader);
+  sh.getRange(rowStart+1,1,diagStrict.length,diagHeader[0].length).setValues(diagStrict);
+  if (diagRelaxed.length){
+    sh.getRange(rowStart+1+diagStrict.length,1,diagRelaxed.length,diagHeader[0].length).setValues(diagRelaxed);
   }
 
-  // Otomatik genişlik
-  sh.autoResizeColumns(1, 10);
+  // Liste başlığı (C sütunundan)
+  const listHeader = ["LABEL","CHROM","POS","REF","ALT","QUAL","DP","ALT_AD","VAF"];
+  const topRows = [];
+  const pushRows = (label, list) => {
+    list.forEach(r => {
+      topRows.push([
+        label, r.chrom, r.pos, r.ref, r.altAllele,
+        isNaN(r.qual) ? "" : r.qual,
+        isNaN(r.dp)   ? "" : r.dp,
+        isNaN(r.alt)  ? "" : r.alt,
+        (isNaN(r.vaf) ? "" : r.vaf.toFixed(3))
+      ]);
+    });
+  };
+
+  pushRows("[Sıkı]", all.strict.topList);
+  if (all.relaxed) pushRows("[Gevşek]", all.relaxed.topList);
+
+  sh.getRange(1,3,1,listHeader.length).setValues([listHeader]);
+  if (topRows.length){
+    sh.getRange(2,3,topRows.length,listHeader.length).setValues(topRows);
+  }
+
+  sh.autoResizeColumns(1, 12);
 }
