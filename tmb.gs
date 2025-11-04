@@ -325,3 +325,35 @@ function tmb_headerIndexMap_(headerRow){
     region:      idxOf(['gene region','region','location'])
   };
 }
+/** ================== KALICI MENÜ: KURULABİLİR onOpen TETİKLEYİCİSİ ================== **/
+
+// Bir kez çalıştır: tetikleyiciyi kurar ve menüyü hemen ekler
+function tmb_bootstrap(){
+  tmb_installOpenTrigger_();
+  addTMBMenu_();
+  SpreadsheetApp.getUi().alert('TMB: Kurulum tamam. Sayfayı her açtığınızda TMB menüsü otomatik eklenecek.');
+}
+
+// Manuel test için (artık tetikleyiciyi de garanti altına alır)
+function tmb_runAddMenuOnce(){
+  tmb_installOpenTrigger_();
+  addTMBMenu_();
+}
+
+// Zaten “çalışma sayfası açıldığında” addTMBMenu_ tetikleyicisi var mı?
+function tmb_hasOpenTrigger_(){
+  const me = ScriptApp.getProjectTriggers();
+  return me.some(t =>
+    t.getHandlerFunction && t.getHandlerFunction() === 'addTMBMenu_' &&
+    t.getEventType && t.getEventType() === ScriptApp.EventType.ON_OPEN
+  );
+}
+
+// Yoksa oluştur
+function tmb_installOpenTrigger_(){
+  if (tmb_hasOpenTrigger_()) return;
+  ScriptApp.newTrigger('addTMBMenu_')
+    .forSpreadsheet(SpreadsheetApp.getActive())
+    .onOpen()
+    .create();
+}
