@@ -6,6 +6,9 @@ function onOpen() {
     .addItem('İki Çalışma Karşılaştırma (50)', 'compareTwoSheets50')
     .addItem('Sadece A3 Özeti Yaz', 'writeSummaryOnlyA3')
     .addToUi();
+    addTMBMenu_(); // TMB menüsünü de ekle
+
+
 }
 
 /** ===================== YARDIMCILAR ===================== **/
@@ -130,10 +133,18 @@ function findQualityMetricsAllSheets_(){
 }
 
 // Tek hücrelik <eşik metni> (A2)
+// *** DEĞİŞİKLİK: Gen anahtarları alfabetik sıralanıyor ***
 function buildBelowThresholdText_(results, coverageThreshold){
+  const genesSorted = Object.keys(results || {})
+    .filter(function(g){ return g != null && g !== ''; })
+    .sort(function(a,b){
+      return a.toString().localeCompare(b.toString(), 'en', {sensitivity:'base'});
+    });
+
   let txt = '- Aşağıdaki genlerin ilgili bölgeleri bu dizileme çalışmasında kapsanmamıştır (okuma derinliği <' + coverageThreshold + '):\n';
-  Object.keys(results).forEach(function(gene){
-    txt += '  - ' + gene + ': ' + results[gene].join(', ') + '\n';
+  genesSorted.forEach(function(gene){
+    // Bölge (region) sırasını aynen bırakıyoruz.
+    txt += '  - ' + gene + ': ' + (results[gene] || []).join(', ') + '\n';
   });
   return txt;
 }
@@ -188,7 +199,7 @@ function buildQcSummaryLine1_(perRegionSheet, threshold){
   parts.push('Özet (eşik ' + threshold + 'x):');
   if (totalsPR.reads && totalsPR.reads > 0) parts.push('Toplam okuma ~ ' + totalsPR.reads);
 
-  // Seçenek 2: UMI sonrası Q + Q30 (ham Q varsa kullanmıyoruz; isterseniz eklenebilir)
+  // Seçenek 2: UMI sonrası Q + Q30
   if (q.umiQ != null)  parts.push('UMI sonrası (hata düzeltilmiş) ort. Q ~ ' + q.umiQ.toFixed(2));
   if (q.q30  != null)  parts.push('Q30 ~ ' + q.q30.toFixed(2) + '%');
 
@@ -266,10 +277,13 @@ function compareTwoSheets50() {
     if (inter.length) commonResults[g] = inter;
   });
 
+  // *** DEĞİŞİKLİK: Gen isimlerini alfabetik sırala, bölgelerin sırası korunur. ***
   let formatted = '- Aşağıdaki genlerin ilgili bölgeleri her iki/çoklu dizileme çalışmasında da kapsanmamıştır (okuma derinliği <50):\n';
-  Object.keys(commonResults).forEach(function(g){
-    formatted += '  - ' + g + ': ' + commonResults[g].join(', ') + '\n';
-  });
+  Object.keys(commonResults)
+    .sort(function(a,b){ return a.toString().localeCompare(b.toString(), 'en', {sensitivity:'base'}); })
+    .forEach(function(g){
+      formatted += '  - ' + g + ': ' + commonResults[g].join(', ') + '\n';
+    });
 
   const out = ss.getSheetByName("karsilastirma") || ss.insertSheet("karsilastirma");
   out.clear();
